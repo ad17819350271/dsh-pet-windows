@@ -11,13 +11,24 @@
  * 不存在"第二套实现对不上"的漂移（这正是 `routes.test.ts` 开头记的那类事故）。
  *
  * 服务替身的降级口径（都是显式失败，不假装成功）：
- *   - `agentDefaultModel.currentSelection()` → `{ provider: 'standalone', model: '' }`
- *     → 余额路由命中"未登记接口"分支 → `{ ok: false, reason: 'unsupported' }`
- *   - `credentials.resolve()` → 恒 `undefined` → 凭证类失败走 `credential-missing`
- *   - `llm.*` → 模型清单为空；生成调用直接抛错 → 碎碎念/对话明确失败，不会静默
+ *   - `agentDefaultModel.currentSelection()` → 有模型通道时返回通道的 provider/model；
+ *     没有（未配置且发现不到 WorkBuddy 的模型配置）→ `{ provider: 'standalone', model: '' }`
+ *     → 余额路由命中"未登记接口"分支 → `{ ok: false, reason: 'unsupported' }`，
+ *     碎碎念/对话回 `provider-missing`
+ *   - `credentials.resolve()` → 通道的 apiKey（余额路由的凭证来源）；无通道时恒 `undefined`
+ *   - `llm.*` → 有通道时接 OpenAI 兼容端点（见 ./llm-channel.ts）；无通道时明确抛错
  *   - `on(...)` → 不订阅任何事件：独立模式没有 DSH 会话，工作状态因此保持空闲
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
+
+import { matchBalanceProvider } from '../host/balance/index';
+import {
+  createStandaloneLlm,
+  describeStandaloneLlm,
+  loadStandaloneLlmConfig,
+  type StandaloneLlm,
+  type StandaloneLlmConfig,
+} from './llm-channel';
 
 /** 独立模式下余额路由报出的服务商 id（未登记 → `unsupported`，气泡里能看到它） */
 export const STANDALONE_PROVIDER = 'standalone';
@@ -46,6 +57,13 @@ export interface StandaloneContextOptions {
   logger: StandaloneLogger;
   /** 注入路由收集数组（独立模式先起服务拿到端口，再 `apply`，两者共用同一个数组） */
   routes?: RegisteredRoute[];
+  /**
+   * 模型通道配置；缺省时自动解析（用户配置 → 环境变量 → WorkBuddy 的 models.json，见 ./llm-channel.ts）。
+   * 传 `null` = **强制不接模型通道**（体检/测试用，保持旧的"明确降级"行为）。
+   */
+  llm?: StandaloneLlmConfig | null;
+  /** 用户配置目录（`<DSH_HOME>/dsh-pet`）：用于发现 `standalone-llm.json`；缺省不查该处 */
+  userConfigDir?: string;
 }
 
 export interface StandaloneContext {
@@ -55,6 +73,8 @@ export interface StandaloneContext {
   routes: RegisteredRoute[];
   /** 初始化期间被记录下来的异常（每项都已按 DSH 的 effect 隔离口径打了日志） */
   failures: string[];
+  /** 生效的模型通道配置（未接入时为 undefined；体检与日志用，**不含 apiKey**） */
+  llmConfig?: StandaloneLlmConfig;
   /** 释放全部 effect：停桌面 Helper、清掉周期定时器 */
   dispose(): Promise<void>;
 }
@@ -89,6 +109,20 @@ export function createStandaloneContext(options: StandaloneContextOptions): Stan
   let disposed = false;
 
   const portOf = (): number => (typeof options.port === 'function' ? options.port() : options.port);
+
+  // 模型通道：`options.llm === null` = 强制不接（体检/测试）；否则用显式配置或自动发现
+  // （用户配置 → 环境变量 → WorkBuddy 的 models.json，见 ./llm-channel.ts）
+  const llmConfig =
+    options.llm === null ? undefined : (options.llm ?? loadStandaloneLlmConfig(process.env, options.userConfigDir));
+  const llm: StandaloneLlm | undefined = llmConfig ? createStandaloneLlm(llmConfig) : undefined;
+  if (llmConfig) logger.info('模型通道：' + describeStandaloneLlm(llmConfig));
+  else logger.info('模型通道：未配置（碎碎念/对话将明确失败；设 DSH_PET_LLM_* 或让 WorkBuddy 配好模型即可）');
+
+  /** 该 provider 的余额凭证 ref（`deepseek-official` → `DEEPSEEK_API_KEY` 等）；未登记 → undefined */
+  const credentialRefOf = (provider: string): string | undefined => {
+    const def = matchBalanceProvider(provider);
+    return def && def.credential.mode === 'ref' ? def.credential.ref : undefined;
+  };
 
   const webServer = {
     /** 读取时取值：服务先监听、端口确定后才 apply，插件在 launchHelper 里读到的就是真端口 */
@@ -136,10 +170,30 @@ export function createStandaloneContext(options: StandaloneContextOptions): Stan
     connection: { authenticatedUrl: (baseUrl: string): string => baseUrl },
     commands: { register: (): (() => void) => () => {} },
     agentDefaultModel: {
-      currentSelection: (): { provider: string; model: string } => ({ provider: STANDALONE_PROVIDER, model: '' }),
+      /**
+       * 有模型通道时返回通道的 provider/model —— 这一个返回值同时决定三件事：
+       * 碎碎念/对话用哪个模型、余额路由按哪个服务商查、日志里的选择标签。
+       * 没有通道时保持旧的 `{ provider: 'standalone', model: '' }`（未配置 → 明确失败）。
+       */
+      currentSelection: (): { provider: string; model: string } =>
+        llmConfig
+          ? { provider: llmConfig.provider, model: llmConfig.model }
+          : { provider: STANDALONE_PROVIDER, model: '' },
     },
-    credentials: { resolve: async (): Promise<undefined> => undefined },
-    llm: {
+    /**
+     * 凭证解析：余额路由的唯一凭证来源。
+     * 只有当"当前 provider 是已登记的余额服务商"且"请求的 ref 正是它的凭证 ref"时才给 key——
+     * 这样默认的 WorkBuddy 通道（`provider: 'workbuddy'`，没有余额接口）不会把 key 交给任何查询，
+     * 而用户把 provider 配成 `deepseek-official` 时余额立刻可用（上游 provider 已实现取数）。
+     */
+    credentials: {
+      resolve: async (ref: unknown): Promise<string | undefined> => {
+        if (!llmConfig) return undefined;
+        const expected = credentialRefOf(llmConfig.provider);
+        return typeof ref === 'string' && expected !== undefined && ref === expected ? llmConfig.apiKey : undefined;
+      },
+    },
+    llm: llm ?? {
       listProviders: (): unknown[] => [],
       listModels: async (): Promise<unknown[]> => [],
       /**
@@ -153,7 +207,7 @@ export function createStandaloneContext(options: StandaloneContextOptions): Stan
        */
       resolveModelInfo: async (): Promise<undefined> => undefined,
       /**
-       * 生成入口：独立模式没有模型后端。
+       * 生成入口：没有模型通道时的明确降级。
        *
        * 必须是 **AsyncIterable**——DSH 的契约是 `stream(options): AsyncIterable<StreamChunk>`，
        * 调用方一律 `for await (const chunk of llm.stream(...))` 消费。错误在首次 `next()` 时抛出，
@@ -172,7 +226,11 @@ export function createStandaloneContext(options: StandaloneContextOptions): Stan
         [Symbol.asyncIterator](): AsyncIterator<never> {
           return {
             next: async (): Promise<IteratorResult<never>> => {
-              throw new Error('dsh-pet standalone: 独立模式未接入模型（碎碎念/对话不可用）');
+              throw new Error(
+                'dsh-pet standalone: 未接入模型通道（碎碎念/对话不可用）。' +
+                  '在 %DSH_HOME%/dsh-pet/standalone-llm.json 填 baseUrl/apiKey/model，' +
+                  '或设 DSH_PET_LLM_BASE_URL + DSH_PET_LLM_API_KEY，或让 WorkBuddy 配好模型。',
+              );
             },
           };
         },
@@ -184,6 +242,7 @@ export function createStandaloneContext(options: StandaloneContextOptions): Stan
     ctx: context,
     routes,
     failures,
+    llmConfig,
     async dispose(): Promise<void> {
       if (disposed) return;
       disposed = true;

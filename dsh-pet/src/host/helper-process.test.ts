@@ -519,7 +519,7 @@ describe('GPU 子进程崩溃自动降级（DSH_PET_DISABLE_GPU / --in-process-g
     assert.equal(resolveGpuFallbackLevel('3', 5), 3);
   });
 
-  test('HelperProcess —— GPU 崩溃两次后重启，env 自动带上 DSH_PET_DISABLE_GPU=2', async (t) => {
+  test('HelperProcess —— GPU 崩溃两次后重启，env 自动带上 DSH_PET_DISABLE_GPU=2', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-pet-gpu-'));
     // 假 helper：每轮往 stderr 打一条 GPU 崩溃签名 + 自己收到的档位，然后非零退出
     const fakeHelper = join(dir, 'fake-helper.js');

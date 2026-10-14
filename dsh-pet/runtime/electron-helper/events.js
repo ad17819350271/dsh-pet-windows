@@ -257,8 +257,55 @@ function applyAnimLeaf(petId, leaf) {
   }
 }
 
-/** 跑一拍 /state（1s 定时与「前端动作后立刻刷新」共用同一份实现） */
-async function pollStateOnce() {
+// ---------- 系统通知（外部事件源 → Windows 原生 toast）----------
+//
+// 与浏览器半侧 notify.ts 的差异只在**事件源**：那边由 DSH 宿主事件生成帧；独立模式与打包版
+// 没有 DSH 会话，帧改由外部事件源 POST 到 /dsh-pet-7340/notify（当前是 WorkBuddy hooks，
+// 见 runtime/win/workbuddy-hook.mjs）。帧 → 文案的映射**复用 shared 那一份**
+// （window.PetShared.frameToToast），两端不各写一套、也就不会漂移。
+
+/** 通知图标 URL（走与光标同一套 pic 路由：<BASE>/pic/<name>.png） */
+function notifyIconUrl(name) {
+  return BASE + '/pic/' + name + '.png';
+}
+
+/** 弹一条系统通知；环境不支持 / 权限被拒时静默跳过（通知永远不该打断业务） */
+function showSystemToast(title, body, icon) {
+  if (typeof Notification === 'undefined') return false;
+  if (Notification.permission === 'denied') return false;
+  try {
+    const options = {};
+    if (body) options.body = String(body).slice(0, 80);
+    if (icon) options.icon = icon;
+    const notification = new Notification(title, options);
+    // 点击通知：把宠物窗口拉到最前（与浏览器侧 window.focus() 对应）
+    notification.onclick = () => {
+      try {
+        window.focus();
+        notification.close();
+      } catch {
+        /* 个别环境不允许 focus：忽略 */
+      }
+    };
+    // 与浏览器侧同口径的日志：只有真正发出时才记，冒烟自检据此断言链路通
+    console.log('【弹窗】' + title + (body ? '：' + body : ''));
+    return true;
+  } catch (error) {
+    console.error('[dsh-pet] 系统通知失败：' + (error && error.message ? error.message : String(error)));
+    return false;
+  }
+}
+
+/** 通知叶子 → 系统 toast（映射来自 shared；未知帧静默跳过，不报错） */
+function applyNotifyLeaf(leaf) {
+  const frame = leaf && leaf.data;
+  if (!frame || typeof frame !== 'object') return;
+  const toast = S.frameToToast(frame);
+  if (!toast) return;
+  showSystemToast(toast.title, toast.body, notifyIconUrl(toast.icon));
+}
+
+/** 跑一拍 /state（1s 定时与「前端动作后立刻刷新」共用同一份实现） */async function pollStateOnce() {
   try {
     const s = await S.fetchState(STATE_URL);
     if (!s) return;
@@ -270,6 +317,8 @@ async function pollStateOnce() {
       if (change.leaf.data === null) continue;
       if (change.path === 'sections.balance') applyBalanceLeaf(change.leaf);
       else if (change.path === 'sections.workStatus') applyWorkStatusLeaf(change.leaf);
+      // 系统通知：外部事件源（WorkBuddy hooks）发到 POST /notify 的帧 → 原生 toast
+      else if (change.path === 'sections.notify') applyNotifyLeaf(change.leaf);
       else if (change.path.startsWith('pets.') && change.path.endsWith('.say')) {
         // 宠物 id **允许含点号**：按前缀/后缀切片，绝不 split('.')
         applySayLeaf(change.path.slice('pets.'.length, -'.say'.length), change.leaf);

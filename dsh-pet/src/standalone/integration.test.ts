@@ -45,7 +45,7 @@ before(async () => {
 
   const routes: RegisteredRoute[] = [];
   const portRef = { value: 0 };
-  const created = createStandaloneContext({ port: () => portRef.value, logger: silent, routes });
+  const created = createStandaloneContext({ port: () => portRef.value, logger: silent, routes, llm: null });
   const listening = await listenStandaloneServer({
     routes,
     logger: silent,

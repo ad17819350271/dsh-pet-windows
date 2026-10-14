@@ -30,7 +30,11 @@ export const USAGE = `dsh-pet 独立模式（不需要 DSH）
 
 说明：
   桌宠在独立模式下以「透明置顶小窗」运行；浏览器内浮层需要有 DSH 网页，独立模式不提供。
-  余额 / 碎碎念 / 对话 / 系统通知依赖 DSH 的服务，在独立模式下不可用。
+  碎碎念 / 对话：接模型通道后可用——优先读 <DSH_HOME>/dsh-pet/standalone-llm.json，
+  其次 DSH_PET_LLM_BASE_URL + DSH_PET_LLM_API_KEY，最后自动复用 WorkBuddy 已配置的模型
+  （~/.workbuddy-ai/models.json）。都没配则明确失败（不伪造文案）。
+  余额：只有当前 provider 有余额接口时可用（如 deepseek-official）；WorkBuddy 通道不提供余额。
+  系统通知：由 WorkBuddy hooks 驱动（见 runtime/win/workbuddy-hook 与 Windows使用说明）。
 `;
 
 /**

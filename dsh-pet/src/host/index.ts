@@ -983,6 +983,46 @@ export function apply(ctx: any): void {
       return { kind: 'json', status: 200, obj: { ok: true } };
     }
 
+    // 系统通知入站：/dsh-pet-7340/notify（POST，body = 一帧通知）
+    //
+    // 为什么需要这个入口：DSH 内运行时通知帧由 host 监听宿主事件生成（session/event、agent/error）；
+    // 独立模式与打包版**没有 DSH 会话**，事件源也就没有了。这里开一个入站口，让外部事件源把
+    // "任务完成 / 在等你确认 / 申请权限"投影成一帧发进来——当前的事件源是 WorkBuddy hooks
+    // （见 runtime/win/workbuddy-hook.mjs），投影脚本只保留结构字段、不碰对话正文。
+    //
+    // 帧契约与 shared/notify.ts 完全一致，桌面渲染端复用同一份 frameToToast 映射，
+    // 所以这里**只做校验 + 落 S**，不做任何文案映射（映射只有一份，避免两端漂移）。
+    if (rest === 'notify') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      const frame: unknown = (() => {
+        try {
+          return JSON.parse(body ?? 'null');
+        } catch {
+          return null;
+        }
+      })();
+      const isFrame =
+        frame !== null &&
+        typeof frame === 'object' &&
+        !Array.isArray(frame) &&
+        typeof (frame as { type?: unknown }).type === 'string';
+      if (!isFrame) {
+        return {
+          kind: 'json',
+          status: 400,
+          obj: { ok: false, reason: 'bad-request', message: 'expected a notify frame: { type: string, ... }' },
+        };
+      }
+      // 总开关与浏览器侧同一字段（成品聚合的 main.notificationsEnabled）：关掉就明确回 disabled，
+      // 让外部事件源能区分"被用户关了"和"没人接"
+      const notifyCfg = readAllConfig(configPaths);
+      if ((notifyCfg.main ?? {}).notificationsEnabled === false) {
+        return { kind: 'json', status: 200, obj: { ok: false, reason: 'disabled' } };
+      }
+      pushNotifyFrame(frame as HostNotifyFrame);
+      return { kind: 'json', status: 200, obj: { ok: true } };
+    }
+
     // 碎碎念：/dsh-pet-7340/whisper?pet=<id>（POST = 立即让桌宠新说一句，返回 {ok}）
     // 动作端点，**不返回文本**——文本走 S 的 pets.<id>.say（碎碎念/命令气泡/对话回复同一个叶子）。
     // 手动语义不受 whisperEnabled 门控：那个字段只关自动周期（与改造前一致）。

@@ -18,6 +18,8 @@
  * `src/standalone/shims/*`、把 `@electron/get` 桩掉（打包 App 自带 Electron，不会走下载路径，
  * 于是产物**不需要任何 node_modules**）。
  */
+import { join } from 'node:path';
+
 import { flattenPetList, readAllConfig } from '../host/config';
 import { dshHomeDir, packageRoot } from '../host/helper-process';
 import { apply } from '../host/index';
@@ -57,7 +59,13 @@ export async function startPetHost(
   const logger = options.logger ?? createStandaloneLogger();
   const routes: RegisteredRoute[] = [];
   const portRef = { value: options.port ?? DEFAULT_APP_PORT };
-  const context = createStandaloneContext({ port: () => portRef.value, logger, routes });
+  const context = createStandaloneContext({
+    port: () => portRef.value,
+    logger,
+    routes,
+    // 让 <DSH_HOME>/dsh-pet/standalone-llm.json 被发现（模型通道的用户配置层）
+    userConfigDir: join(dshHomeDir(), 'dsh-pet'),
+  });
 
   let disposed = false;
   const server = await listenStandaloneServer({

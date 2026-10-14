@@ -79,7 +79,9 @@ node lib\standalone.js --check   :: 只体检，不开窗
 | 4 | `loadFile('index.html')` 用相对路径（按 `app.getAppPath()` 解析） | 改绝对路径，否则打包后页面 `ERR_FILE_NOT_FOUND` |
 | 5 | 构建：pnpm 默认 isolated 链接器在 Windows 上顶层大面积静默缺链（`tsdown` 命令都找不到） | 文档给出 `--config.node-linker=hoisted`；新增 `npm run pack:win` |
 | 6 | 无退出入口（打包后没有窗口关闭按钮） | 新增 `stop-pet.cmd` / `stop-pet.ps1`（不依赖 Node，走 `POST /shutdown`），`/shutdown` 在打包版里真正退出 App |
-| 7 | — | 新增单测：GPU 降级纯函数与重启注入 4 例；同步两处防漂移守卫（**全套 658 项测试通过**） |
+| 7 | **独立模式下碎碎念 / 对话不可用**：上游把生成收口在 DSH 的 `ctx.llm`，独立模式只提供"明确降级"的替身 | 新增模型通道 `src/standalone/llm-channel.ts`：把 `ctx.llm` 接到 OpenAI 兼容端点（流式 SSE + 终止块），上游 `whisper.ts` / `chat.ts` **一行未改**。四级配置来源，**默认自动复用 WorkBuddy 已配置的模型**（`~/.workbuddy-ai/models.json`），零额外配置 |
+| 8 | **独立模式下系统通知没有事件源**（DSH 会话事件在独立模式不存在） | 新增入站端点 `POST /dsh-pet-7340/notify` + 桌面端 Windows 原生通知（复用 shared 的 `frameToToast` 映射，两端不漂移）+ WorkBuddy hooks 投影脚本与安装器（`runtime/win/`） |
+| 9 | — | 新增单测：GPU 降级 4 例、模型通道 26 例、hook 链路 20 例；同步 4 处旧契约断言（**全套 709 项测试通过**） |
 
 ### 关键设计：内嵌宿主（单进程）
 
@@ -119,13 +121,50 @@ node lib\standalone.js --check   :: 只体检，不开窗
 `display` 需含 `desktop` 或 `both` 才会出现桌面小窗。完整字段说明见
 [`dsh-pet/Windows使用说明.md`](dsh-pet/Windows使用说明.md) 与上游 README。
 
+## WorkBuddy 集成（碎碎念 / 对话 / 通知）
+
+独立模式与打包版**没有 DSH**，但可以把这四件事接到 **WorkBuddy** 上：
+
+| 功能 | 状态 | 怎么来的 |
+| --- | --- | --- |
+| 碎碎念 | ✅ 可用 | 模型通道默认自动复用 WorkBuddy 已配置的模型（`~/.workbuddy-ai/models.json`），零额外配置 |
+| 对话 | ✅ 可用 | 同上（含多轮记忆 `memory.json`、配图选图） |
+| 系统通知 | ✅ 可用 | WorkBuddy hooks → 投影脚本 → `POST /notify` → Windows 原生通知 |
+| 余额 | ⚠️ 需自备 key | WorkBuddy 无余额接口；把 provider 配成 `deepseek-official` 并给 key 即可（上游已实现取数） |
+
+### 模型通道
+
+```jsonc
+// %USERPROFILE%\.dsh\dsh-pet\standalone-llm.json（可选：不填则自动用 WorkBuddy 的模型）
+{ "provider": "deepseek-official", "baseUrl": "https://api.deepseek.com", "apiKey": "sk-…", "model": "deepseek-chat" }
+```
+
+实测（GLM Coding Plan）：`glm-5.3` 属"始终思考"的模型，**关不掉思考**（传 `thinking:{type:disabled}` → 400），
+但传 `reasoning_effort: 'low'` 后思考 token 归零、**1.1 秒出正文**；不传则会先烧掉数百 reasoning token，
+`max_tokens` 给小了直接拿到**空 content**——通道因此默认 `reasoning_effort: 'low'` + `max_tokens: 512`。
+
+### 系统通知
+
+```bat
+node runtime\win\install-workbuddy-hooks.mjs --dry-run   :: 先看变更（会先备份 settings.json）
+node runtime\win\install-workbuddy-hooks.mjs             :: 装 Stop / PermissionRequest / Notification
+node runtime\win\install-workbuddy-hooks.mjs --uninstall :: 卸载
+```
+
+装完**必须完全退出 WorkBuddy 再打开**（hooks 配置在启动时缓存，关窗不算退出）。
+隐私上只投影结构字段（事件名 / session_id / 工具名 / "回复是否以问句结尾"这个布尔），
+`prompt`、`tool_input`、`last_assistant_message` 一个都不读不传（有单测守着）；
+并且 **fail-open**：桌宠没开时 hook 静默退出，绝不卡住 WorkBuddy。
+
 ## 已知限制
 
-- **余额 / 碎碎念 / 对话 / 系统通知**依赖 DSH 本体的凭证、模型与会话，在独立模式与打包版里
-  不可用（返回结构化失败，不假装成功）。这是上游的设计边界，本仓库未改动。
+- **余额**需要自备有余额接口的服务商 key（WorkBuddy 的 Coding Plan 是订阅制、无余额接口）。
+  未配置时余额显示为不可用（结构化失败，不伪造数字）。
 - 打包版是**便携目录**而非安装包：拷走整个 `dist\dsh-pet-win\` 即可运行。
 - 打包版在部分环境（RDP / 虚拟机 / 显卡驱动异常）依赖 `--in-process-gpu` 规避 GPU 崩溃；
   若你的机器 GPU 正常且想用原行为，设 `DSH_PET_FORCE_GPU=1`。
+- 模型通道默认复用 WorkBuddy 的模型 key，**会消耗你在 WorkBuddy 里的额度**；不想共用就在
+  `standalone-llm.json` 里填自己的 key（优先级高于自动发现）。
 
 ## 从源码重新构建 / 打包
 

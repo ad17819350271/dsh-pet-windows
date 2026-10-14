@@ -57,7 +57,7 @@ const llmOf = (
 
 describe('createStandaloneContext —— 与 Cordis 对齐的语义', () => {
   test('effect 同步执行、收集释放函数；dispose 逆序释放且等待异步释放', async () => {
-    const context = createStandaloneContext({ port: 1, logger: silentLogger() });
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: null });
     const order: string[] = [];
     const effect = effectOf(context);
     // 同步执行：apply() 返回后路由必须已经在册（仓库自己的 routes.test.ts 也依赖这一点）
@@ -81,7 +81,7 @@ describe('createStandaloneContext —— 与 Cordis 对齐的语义', () => {
 
   test('effect 内抛错只记录不中断（源码形态读不到包内 assets 时正是这里抛）', () => {
     const logger = silentLogger();
-    const context = createStandaloneContext({ port: 1, logger });
+    const context = createStandaloneContext({ port: 1, logger, llm: null });
     const effect = effectOf(context);
     effect(() => {
       throw new Error('内置默认配置缺失');
@@ -93,7 +93,7 @@ describe('createStandaloneContext —— 与 Cordis 对齐的语义', () => {
   });
 
   test('webServer.register 收下路由并返回可调用对象（插件把它当 effect 释放函数）', () => {
-    const context = createStandaloneContext({ port: 1, logger: silentLogger() });
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: null });
     const webServer = webServerOf(context);
     const handler = (): void => {};
     const dispose = webServer.register({ kind: 'prefix', path: '/dsh-pet-7340', handler });
@@ -107,7 +107,7 @@ describe('createStandaloneContext —— 与 Cordis 对齐的语义', () => {
 
   test('webServer.port 惰性读取：先起服务、后 apply 时插件读到的是真端口', () => {
     const portRef = { value: 0 };
-    const context = createStandaloneContext({ port: () => portRef.value, logger: silentLogger() });
+    const context = createStandaloneContext({ port: () => portRef.value, logger: silentLogger(), llm: null });
     const webServer = webServerOf(context);
     assert.equal(webServer.port, 0, '未监听时端口就是 0（插件据此延迟重试，不会误拉窗口）');
     portRef.value = 31234;
@@ -115,15 +115,18 @@ describe('createStandaloneContext —— 与 Cordis 对齐的语义', () => {
   });
 
   test('on() / commands.register() 必须返回可调用对象（插件把它们当释放函数用）', () => {
-    const context = createStandaloneContext({ port: 1, logger: silentLogger() });
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: null });
     assert.equal(typeof onOf(context)(), 'function');
     assert.equal(typeof commandsOf(context).register(), 'function');
   });
 });
 
 describe('服务替身的降级口径 —— 显式失败，不假装成功', () => {
+  // 注意 `llm: null`：不传时 ctx 会**自动发现**模型通道（用户配置 → 环境变量 →
+  // WorkBuddy 的 models.json，见 ./llm-channel.ts），那样断言就取决于本机装没装 WorkBuddy。
+  // 这里显式关掉通道，专测"没通道时的降级口径"；通道接上的行为由下面一组用例覆盖。
   test('currentSelection 的 model 为空 → 模型候选链为空（生成停在候选阶段）', () => {
-    const context = createStandaloneContext({ port: 1, logger: silentLogger() });
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: null });
     const selection = agentOf(context).currentSelection();
     assert.equal(selection.provider, STANDALONE_PROVIDER);
     // model 必须为空：model-selection.currentModel() 以「provider 与 model 都非空」为有效条件，
@@ -134,13 +137,13 @@ describe('服务替身的降级口径 —— 显式失败，不假装成功', ()
   });
 
   test('碎碎念用这份 ctx 得到结构化失败 provider-missing（不联网、不编文案）', async () => {
-    const context = createStandaloneContext({ port: 1, logger: silentLogger() });
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: null });
     const result = await generateWhisper(context.ctx as never, '你是一只桌宠');
     assert.deepEqual(result, { ok: false, reason: 'provider-missing', message: '当前对话未配置模型' });
   });
 
   test('凭证恒不可得；llm 清单为空、生成入口是"迭代即失败"的 async iterable', async () => {
-    const context = createStandaloneContext({ port: 1, logger: silentLogger() });
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: null });
     assert.equal(await credentialsOf(context).resolve('DEEPSEEK_API_KEY'), undefined);
     const llm = llmOf(context);
     assert.deepEqual(llm.listProviders(), []);
@@ -152,6 +155,62 @@ describe('服务替身的降级口径 —— 显式失败，不假装成功', ()
     assert.equal(typeof streamed[Symbol.asyncIterator], 'function');
     await assert.rejects(async () => {
       for await (const chunk of streamed) void chunk;
-    }, /独立模式未接入模型/);
+    }, /未接入模型通道/);
+  });
+});
+
+describe('模型通道接线 —— 接上后四个成员的语义', () => {
+  /** 一份显式通道配置（不联网，只验证接线） */
+  const channelConfig = {
+    provider: 'deepseek-official',
+    baseUrl: 'https://api.deepseek.com',
+    apiKey: 'sk-test-key',
+    model: 'deepseek-chat',
+    maxTokens: 512,
+    reasoningEffort: 'low',
+    source: 'test',
+  };
+
+  test('currentSelection 给出通道的 provider/model（碎碎念/对话/余额三处共用这一个返回值）', () => {
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: channelConfig });
+    assert.deepEqual(agentOf(context).currentSelection(), {
+      provider: 'deepseek-official',
+      model: 'deepseek-chat',
+    });
+    // 候选链非空 → 生成侧不再停在"当前对话未配置模型"
+    assert.deepEqual(modelCandidates(context.ctx as never, undefined), [
+      { provider: 'deepseek-official', model: 'deepseek-chat' },
+    ]);
+    assert.equal(context.llmConfig?.model, 'deepseek-chat');
+  });
+
+  test('凭证只给"当前 provider 的余额凭证 ref"，其余 ref 一律不给', async () => {
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: channelConfig });
+    // deepseek-official 在余额登记表里的 ref 正是 DEEPSEEK_API_KEY
+    assert.equal(await credentialsOf(context).resolve('DEEPSEEK_API_KEY'), 'sk-test-key');
+    assert.equal(await credentialsOf(context).resolve('OPENCODE_API_KEY'), undefined);
+    assert.equal(await credentialsOf(context).resolve(undefined), undefined);
+  });
+
+  test('WorkBuddy 通道（无余额接口）不把 key 交给任何余额查询', async () => {
+    const context = createStandaloneContext({
+      port: 1,
+      logger: silentLogger(),
+      llm: { ...channelConfig, provider: 'workbuddy', model: 'glm-5.3' },
+    });
+    assert.equal(await credentialsOf(context).resolve('DEEPSEEK_API_KEY'), undefined);
+  });
+
+  test('llm 清单与元数据来自通道（不声明 off，让上游省略自己的 effort）', async () => {
+    const context = createStandaloneContext({ port: 1, logger: silentLogger(), llm: channelConfig });
+    const llm = llmOf(context);
+    assert.deepEqual(llm.listProviders(), [{ id: 'deepseek-official' }]);
+    assert.deepEqual(await llm.listModels('deepseek-official'), [
+      { id: 'deepseek-chat', provider: 'deepseek-official' },
+    ]);
+    const info = await (llm as unknown as {
+      resolveModelInfo(p: string, m: string): Promise<{ reasoning?: { efforts: Array<{ id: string }> } }>;
+    }).resolveModelInfo('deepseek-official', 'deepseek-chat');
+    assert.equal(info.reasoning?.efforts.some((e) => e.id === 'off'), false);
   });
 });

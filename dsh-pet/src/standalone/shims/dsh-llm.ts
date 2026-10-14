@@ -43,17 +43,33 @@ export interface StandaloneTextBlock {
 }
 
 /**
- * 流式文本拼装：只收集文本块（与调用方 `blocks().filter(b => b.type === 'text')` 的用法一致）。
- * 独立模式只会拿到空流（没有模型后端），这里保持最小可用实现。
+ * 流式文本拼装：收集文本块 + 记录终止块（与调用方
+ * `blocks().filter(b => b.type === 'text')` 和 `noTextReason(assembler.finish)` 的用法一致）。
+ *
+ * 为什么要有 `finish`：调用方在没有正文时会读 `assembler.finish` 给出**准确**原因
+ * （`noTextReason` 认 `max-tokens` / `aborted` / `error`）。独立模式的模型通道会 yield
+ * `{ type: 'finish', finish: { kind } }`（见 ../llm-channel.ts），这里必须接住它，
+ * 否则"模型思考吃光了 token 预算"只会显示成笼统的"模型未返回文本"。
  */
 export class BlockAssembler {
   private readonly chunks: string[] = [];
+  /** 终止信息（最后一个终止块胜出；DSH 侧语义相同） */
+  finish: { kind?: string; failure?: unknown } | undefined;
 
-  /** 收集一个块；非文本块（工具调用等）在独立模式下被忽略 */
+  /** 收集一个块；文本块入正文，终止块记原因，其余（工具调用等）在独立模式下忽略 */
   push(chunk: unknown): void {
-    if (chunk !== null && typeof chunk === 'object' && (chunk as { type?: unknown }).type === 'text') {
-      const text = (chunk as { text?: unknown }).text;
-      if (typeof text === 'string') this.chunks.push(text);
+    if (chunk === null || typeof chunk !== 'object') return;
+    const typed = chunk as { type?: unknown; text?: unknown; finish?: unknown };
+    if (typed.type === 'text') {
+      if (typeof typed.text === 'string') this.chunks.push(typed.text);
+      return;
+    }
+    if (typed.type === 'finish') {
+      const finish = typed.finish;
+      this.finish =
+        finish !== null && typeof finish === 'object'
+          ? (finish as { kind?: string; failure?: unknown })
+          : { kind: typeof finish === 'string' ? finish : undefined };
     }
   }
 

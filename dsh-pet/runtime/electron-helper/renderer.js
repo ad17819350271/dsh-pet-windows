@@ -20,7 +20,8 @@
  *   - 右键级联菜单（与浏览器共用同一份组件：树+渲染+样式来自 shared-core 的 menu 模块）：
  *     右键宠物弹出，桌面端工具根项「打开网站 / 打开 DeepSeek Harness（宿主是 DSH 桌面应用时的同一项）/ 查看余额 / 回到初始位置 / 重载配置」+ 动作点播；
  *     菜单开启期间整窗保持可交互（悬停菜单不触发穿透翻转），关闭/离开窗口即恢复穿透。
- *   - 系统通知不是宠物行为（浏览器半侧 notify.ts 负责），桌面端不重复实现。
+ *   - 系统通知：**独立模式/打包版**由外部事件源驱动（WorkBuddy hooks → POST /notify → 原生 toast，
+ *     见 events.js 的 applyNotifyLeaf）。DSH 内运行时仍由浏览器半侧 notify.ts 负责，桌面端不重复弹。
  */
 'use strict';
 

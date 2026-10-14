@@ -16,10 +16,12 @@
  *   node lib/standalone.js --check      # 只体检，不开窗口
  *
  * 独立模式的边界：动画、物理拖拽、右键菜单、多开、自定义素材与宠物种类全部可用；
- * 余额、碎碎念、对话、系统通知依赖 DSH 的凭证/模型/会话，在独立模式下明确不可用
+ * 碎碎念 / 对话：接上模型通道后可用（见 ./llm-channel.ts：用户配置 → 环境变量 → 复用 WorkBuddy
+ * 已配置的模型）；余额取决于 provider 有没有余额接口；系统通知由 WorkBuddy hooks 驱动。
  * （结构化失败 + 日志，不假装成功）。详见 README 的「独立运行（不打开 DSH）」一节。
  */
 import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { flattenPetList, readAllConfig } from '../host/config';
 import { dshHomeDir, packageRoot } from '../host/helper-process';
@@ -51,7 +53,13 @@ async function run(logger: StandaloneLogger, options: { port: number }): Promise
 
   const routes: RegisteredRoute[] = [];
   const portRef = { value: options.port };
-  const context = createStandaloneContext({ port: () => portRef.value, logger, routes });
+  const context = createStandaloneContext({
+    port: () => portRef.value,
+    logger,
+    routes,
+    // 让 <DSH_HOME>/dsh-pet/standalone-llm.json 被发现（模型通道的用户配置层）
+    userConfigDir: join(home, 'dsh-pet'),
+  });
   // /shutdown 的回调要在服务构造时给出去，而停机函数要在服务之后定义：
   // 用一个可替换的转发器解耦（服务构造时只拿到"将来会是谁"）。
   let forwardShutdown: () => void = () => {};
@@ -115,7 +123,15 @@ async function run(logger: StandaloneLogger, options: { port: number }): Promise
     desktopVisible.length === 0
       ? '  桌面小窗    0 只：display 需要 desktop 或 both 才会出现透明小窗（服务仍在运行）'
       : `  桌面小窗    ${desktopVisible.length} 只`,
-    '  不可用      余额 / 碎碎念 / 对话 / 系统通知（依赖 DSH 的凭证、模型与会话）',
+    // 模型通道接上了就说明碎碎念/对话可用；余额取决于当前 provider 有没有余额接口
+    // （WorkBuddy 通道没有；配成 deepseek-official 就有了）——分开报，别一句话全否掉
+    context.llmConfig
+      ? `  可用        碎碎念 / 对话（模型 ${context.llmConfig.model}，来源见上方"模型通道"行）` +
+        (context.llmConfig.provider === 'workbuddy'
+          ? '；余额不可用（WorkBuddy 不提供余额接口）'
+          : '')
+      : '  不可用      碎碎念 / 对话 / 余额（未配置模型通道：设 DSH_PET_LLM_* 或让 WorkBuddy 配好模型）',
+    '  系统通知    由 WorkBuddy hooks 驱动（配好 hooks 后任务完成/等确认会弹 Windows 通知）',
     '  退出        Ctrl+C，或 POST /shutdown',
     '',
   ]) {

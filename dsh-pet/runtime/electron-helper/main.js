@@ -95,6 +95,13 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 // 内嵌宿主（打包 App）用 'dsh-pet'：与 App 自身的 package.json name 一致，是它自己的数据目录。
 app.setName(EMBED_HOST ? 'dsh-pet' : 'dsh-pet-electron-helper');
 
+// Windows 系统通知需要 AppUserModelID：没有它时 Chromium 的 Notification 会退化成
+// "来自 Electron" 或干脆不显示（任务栏/操作中心也不认这个来源）。打包版用稳定 id，
+// 两进程形态（被 DSH/独立 CLI 拉起）用另一个，互不冒充。
+if (process.platform === 'win32') {
+  app.setAppUserModelId(EMBED_HOST ? 'com.dshpet.windows' : 'com.dshpet.helper');
+}
+
 /** DPI 探测子进程模式：不建窗口，只把主屏 scaleFactor 打到 stdout 就退出（见 probePrimaryScale） */
 const DPI_PROBE = process.env.DSH_PET_DPI_PROBE === '1';
 /** 探测进程的输出标记（父进程按它抓值） */

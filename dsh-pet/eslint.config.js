@@ -8,7 +8,11 @@ import tseslint from 'typescript-eslint';
 import reactHooks from 'eslint-plugin-react-hooks';
 
 export default tseslint.config(
-  { ignores: ['lib/**', 'scripts/**', 'assets/**', 'runtime/**', 'node_modules/**'] },
+  {
+    // dist/** 是打包产物（scripts/pack-win.mjs 把 Electron 运行时 + 我们的 app 拷进来，含大量第三方 JS），
+    // 不该参与本仓库的 lint —— 漏了它会让 `eslint .` 一次报出几百个第三方文件的 no-undef。
+    ignores: ['lib/**', 'dist/**', 'scripts/**', 'assets/**', 'runtime/**', 'node_modules/**'],
+  },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -26,6 +30,22 @@ export default tseslint.config(
     rules: {
       'react-hooks/rules-of-hooks': 'error',
       'react-hooks/exhaustive-deps': 'warn',
+    },
+  },
+  {
+    // 仓库根下的 Node 脚本（stop-pet.mjs 等）：声明用到的 Node 全局，
+    // 否则 js.configs.recommended 会把 process/console/fetch 报成 no-undef
+    files: ['**/*.mjs', '**/*.cjs'],
+    languageOptions: {
+      globals: {
+        process: 'readonly',
+        console: 'readonly',
+        fetch: 'readonly',
+        URL: 'readonly',
+        Buffer: 'readonly',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
+      },
     },
   },
   {

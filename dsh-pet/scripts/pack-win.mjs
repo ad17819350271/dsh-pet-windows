@@ -130,8 +130,13 @@ function buildAppDir(appDir) {
     if (existsSync(join(ROOT, doc))) cpSync(join(ROOT, doc), join(appDir, doc));
   }
 
-  // 退出入口（放到 exe 同级目录，用户直接看得到）：不依赖 Node，走 POST /shutdown
-  for (const item of ['stop-pet.cmd', 'stop-pet.ps1']) {
+  // 退出入口 + WorkBuddy 通知安装器（放到 exe 同级目录，用户直接看得到；都不依赖本机 Node 之外的依赖）
+  for (const item of [
+    'stop-pet.cmd',
+    'stop-pet.ps1',
+    'workbuddy-hook.mjs',
+    'install-workbuddy-hooks.mjs',
+  ]) {
     cpSync(join(ROOT, 'runtime', 'win', item), join(OUT, item));
   }
 }
