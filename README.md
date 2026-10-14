@@ -22,7 +22,19 @@ Electron 的 GPU 子进程以 `0xC0000005`（访问违例）反复崩溃并令�
 
 ## 快速开始
 
-### 方式一：免安装 exe（推荐）
+### 方式零：直接下载现成 exe（最省事）
+
+到 **[Releases](https://github.com/ad17819350271/dsh-pet-windows/releases/latest)** 下载
+`dsh-pet-win-v0.3.6.zip`（196.9 MB），解压到任意目录，双击 `dsh-pet.exe` 即可——
+**不需要 Node.js，不需要联网下载任何东西**。
+
+| 操作 | 方法 |
+| --- | --- |
+| 启动 | 双击 `dsh-pet.exe` |
+| 停止 | 双击 `stop-pet.cmd`，或任务管理器结束 `dsh-pet.exe` |
+| 多开 | 再双击一次 `dsh-pet.exe`（第二只宠物自动用 3081 端口） |
+
+### 方式一：自己打包免安装 exe（推荐给要改代码的人）
 
 ```bat
 npm install                  :: 首次
