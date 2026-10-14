@@ -17,6 +17,9 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
+  GPU_CRASH_RE,
+  GPU_FALLBACK_AFTER,
+  GPU_FALLBACK_LEVEL,
   HELPER_STABLE_MS,
   HELPER_STOP_GRACE_MS,
   HelperProcess,
@@ -26,9 +29,12 @@ import {
   hasGraphicalDisplay,
   helperRunIsStable,
   helperSpawnEnv,
+  isGpuCrashLog,
   restartBackoffDelayMs,
   resolveElectronPath,
+  resolveGpuFallbackLevel,
   shouldCircuitBreak,
+  shouldFallbackDisableGpu,
 } from './helper-process.ts';
 
 test('Electron 安装目录无法创建时返回 undefined，不产生未处理拒绝', async (t) => {
@@ -466,4 +472,90 @@ describe('HelperProcess failed spawn recovery', () => {
       },
     );
   }
+});
+
+describe('GPU 子进程崩溃自动降级（DSH_PET_DISABLE_GPU / --in-process-gpu）', () => {
+  test('isGpuCrashLog —— 识别 Chromium GPU 进程崩溃签名', () => {
+    assert.equal(
+      GPU_CRASH_RE.source.includes('GPU process exited unexpectedly'),
+      true,
+    );
+    assert.ok(
+      isGpuCrashLog(
+        '[22896:1014/094845.058:ERROR:content\\browser\\gpu\\gpu_process_host.cc:1089] GPU process exited unexpectedly: exit_code=-1073741819',
+      ),
+    );
+    assert.ok(
+      isGpuCrashLog(
+        "[22896:...:FATAL:content\\browser\\gpu\\gpu_data_manager_impl_private.cc:416] GPU process isn't usable. Goodbye.",
+      ),
+    );
+    // 普通 helper 日志（displays 行带 JSON，含 GPU 字样也不算崩溃）
+    assert.equal(
+      isGpuCrashLog('[dsh-pet-desktop-helper] displays: {"hull":{"x":0,"y":0,"width":5280,"height":2560}}'),
+      false,
+    );
+  });
+
+  test('shouldFallbackDisableGpu —— 阈值 2 次签名后启用', () => {
+    assert.equal(GPU_FALLBACK_AFTER, 2);
+    assert.equal(GPU_FALLBACK_LEVEL, 2);
+    assert.equal(shouldFallbackDisableGpu(0), false);
+    assert.equal(shouldFallbackDisableGpu(1), false);
+    assert.equal(shouldFallbackDisableGpu(2), true);
+    assert.equal(shouldFallbackDisableGpu(7), true);
+  });
+
+  test('resolveGpuFallbackLevel —— 未达阈值保持原值；达阈值升 2；不覆盖用户更高档位', () => {
+    // 未设且无崩溃：现状
+    assert.equal(resolveGpuFallbackLevel(undefined, 0), 0);
+    assert.equal(resolveGpuFallbackLevel('', 1), 0);
+    // 用户显式档位在阈值前原样继承
+    assert.equal(resolveGpuFallbackLevel('1', 1), 1);
+    assert.equal(resolveGpuFallbackLevel('3', 1), 3);
+    // 达阈值：自动档（2）盖过无效的 1，但不盖过用户已选的 3
+    assert.equal(resolveGpuFallbackLevel(undefined, 2), 2);
+    assert.equal(resolveGpuFallbackLevel('1', 2), 2);
+    assert.equal(resolveGpuFallbackLevel('3', 5), 3);
+  });
+
+  test('HelperProcess —— GPU 崩溃两次后重启，env 自动带上 DSH_PET_DISABLE_GPU=2', async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-pet-gpu-'));
+    // 假 helper：每轮往 stderr 打一条 GPU 崩溃签名 + 自己收到的档位，然后非零退出
+    const fakeHelper = join(dir, 'fake-helper.js');
+    writeFileSync(
+      fakeHelper,
+      [
+        "process.stderr.write('[9999:0101/000000.000:ERROR:content\\\\browser\\\\gpu\\\\gpu_process_host.cc:1089] GPU process exited unexpectedly: exit_code=-1073741819\\n');",
+        "process.stderr.write('SEEN_GPU_LEVEL=' + (process.env.DSH_PET_DISABLE_GPU || 'none') + '\\n');",
+        'process.exit(1);',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const options = { command: process.execPath, args: [fakeHelper] };
+    const logs: string[] = [];
+    const hp = new HelperProcess(options, { warn: (message) => logs.push(String(message)) });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      hp.start();
+      // 第 1 轮：未见档位；第 2 轮崩溃后达阈值；第 3 轮起 env 注入 2
+      await new Promise<void>((resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error('helper 未在预期轮次内重启')), 10000);
+        const tick = setInterval(() => {
+          if (logs.some((line) => line.includes('SEEN_GPU_LEVEL=2'))) {
+            clearInterval(tick);
+            resolve();
+          }
+        }, 100);
+      });
+      assert.ok(logs.some((line) => line.includes('SEEN_GPU_LEVEL=2')));
+      assert.ok(logs.some((line) => line.includes('自动降级')));
+      assert.ok(logs.some((line) => line.includes('DSH_PET_DISABLE_GPU=2')));
+    } finally {
+      clearTimeout(timeout);
+      await hp.stopAndWait('test-cleanup', 100);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

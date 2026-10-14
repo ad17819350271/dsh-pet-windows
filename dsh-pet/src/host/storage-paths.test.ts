@@ -131,10 +131,20 @@ describe('profileNameFrom —— 卸载命令里的 profile 名', () => {
 });
 
 describe('DESKTOP_APP_NAME —— 与桌面端实际应用名防漂移', () => {
-  test('与 runtime/electron-helper/main.js 的 app.setName 一致', () => {
-    const src = readFileSync(new URL('../../runtime/electron-helper/main.js', import.meta.url), 'utf8');
-    const m = /app\.setName\(\s*['"]([^'"]+)['"]\s*\)/.exec(src);
-    assert.ok(m, 'main.js 里没有找到 app.setName');
-    assert.equal(m[1], DESKTOP_APP_NAME);
+  const mainSrc = readFileSync(new URL('../../runtime/electron-helper/main.js', import.meta.url), 'utf8');
+
+  test('两进程 helper 分支（非内嵌）的 app.setName 与 DESKTOP_APP_NAME 一致', () => {
+    const m = /app\.setName\(\s*EMBED_HOST\s*\?\s*'([^']+)'\s*:\s*'([^']+)'\s*\)/.exec(mainSrc);
+    assert.ok(m, 'main.js 的 app.setName 结构变了（内嵌模式引入了第二个名字，本断言需同步）');
+    assert.equal(m[2], DESKTOP_APP_NAME, '非内嵌（DSH/独立模式 helper）必须沿用 DESKTOP_APP_NAME');
+  });
+
+  test('打包 App 分支的应用名与打包脚本写的 package.json name 一致', () => {
+    const m = /app\.setName\(\s*EMBED_HOST\s*\?\s*'([^']+)'\s*:\s*'([^']+)'\s*\)/.exec(mainSrc);
+    assert.ok(m, 'main.js 的 app.setName 结构变了（本断言需同步）');
+    const packSrc = readFileSync(new URL('../../scripts/pack-win.mjs', import.meta.url), 'utf8');
+    const p = /name:\s*'([^']+)'/.exec(packSrc);
+    assert.ok(p, 'pack-win.mjs 里没有找到写入的 package.json name');
+    assert.equal(m[1], p[1], '内嵌分支（打包 App）名必须与打包脚本写入的 name 一致');
   });
 });

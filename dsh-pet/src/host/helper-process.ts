@@ -26,6 +26,46 @@ export const defaultHelperMain = resolve(packageRoot, 'runtime', 'electron-helpe
 /** 协议行前缀：stdout/stdin 里以此开头的整行 JSON 属于 bridge 协议，其余为日志 */
 export const BRIDGE_PREFIX = 'dsh-pet-bridge:';
 
+/**
+ * GPU 进程崩溃签名（Chromium gpu_process_host.cc / gpu_data_manager_impl_private.cc 日志）。
+ *
+ * 【为什么宿主要认识它】Windows 的部分环境（RDP 会话、虚拟机、显卡驱动异常）里，Electron 的
+ * 独立 GPU 进程以 0xC0000005 反复退出并令 helper 主进程 FATAL——守护循环拉起→崩溃→重启，
+ * 用户侧表现为"桌宠永远出不来"，只看到刷屏的 ERROR 日志。
+ * 匹配到本签名达到阈值后，宿主在下次重启时给 helper 带上 DSH_PET_DISABLE_GPU=2
+ * （--in-process-gpu，GPU 服务并入浏览器进程，子进程崩溃消失；实测冒烟零崩溃）。
+ * 判据说明与其它档位见 runtime/electron-helper/main.js 的同名注释。
+ */
+export const GPU_CRASH_RE = /GPU process exited unexpectedly|GPU process isn'?t usable/;
+
+/** 触发 GPU 降级的崩溃累计次数（守护循环不会自行恢复该崩溃，故阈值取小值） */
+export const GPU_FALLBACK_AFTER = 2;
+
+/** 降级档位：≥2（--in-process-gpu）。1（--disable-gpu）单独使用时已实测无效，故自动降级跳过它。 */
+export const GPU_FALLBACK_LEVEL = 2;
+
+/** stderr 的一行是否是 GPU 进程崩溃日志（纯函数，供单测与守护循环计数共用） */
+export function isGpuCrashLog(line: string): boolean {
+  return GPU_CRASH_RE.test(line);
+}
+
+/** 累计崩溃达到阈值 → 应启用自动降级（纯函数） */
+export function shouldFallbackDisableGpu(gpuCrashCount: number): boolean {
+  return gpuCrashCount >= GPU_FALLBACK_AFTER;
+}
+
+/**
+ * 重启时生效的 GPU 降级档位（纯函数）：
+ *   - 未达阈值时保持原样（用户/宿主显式设了什么就继承什么，含未设的 0）；
+ *   - 达阈值后取 max(现有档位, 2)——用户已显式选了更高档位（3）时不改动他的选择。
+ */
+export function resolveGpuFallbackLevel(currentEnvValue: string | undefined, gpuCrashCount: number): number {
+  const existing = Number.parseInt(String(currentEnvValue ?? ''), 10);
+  const base = Number.isFinite(existing) && existing > 0 ? existing : 0;
+  if (!shouldFallbackDisableGpu(gpuCrashCount)) return base;
+  return Math.max(base, GPU_FALLBACK_LEVEL);
+}
+
 /** 渲染端（经 main.js 转发）的一次请求：URL 是 /dsh-pet-7340/... 路径 + 查询串；
  *  cb = main.js 本地回调服务器地址（宿主把应答 POST 回去；Electron 主进程读不到 piped stdin，
  *  故应答不走 0 号管道 —— electron#4218） */
@@ -291,6 +331,12 @@ export class HelperProcess {
   declare private restartTimer?: NodeJS.Timeout;
   /** 连续崩溃计数（稳定运行 ≥3 分钟清零；达上限触发熔断） */
   declare private restartFailures: number;
+  /** GPU 子进程崩溃计数（helper-process.ts 头部 GPU_CRASH_RE；达阈值自动降级） */
+  declare private gpuCrashCount: number;
+  /** 自动降级档位（0 = 未启用；已生效时重启 helper 带上 DSH_PET_DISABLE_GPU） */
+  declare private gpuFallbackLevel: number;
+  /** 降级提示是否已打印过（只提醒一次，之后每轮刷屏的 ERROR 不再重复解释） */
+  declare private gpuFallbackNotified: boolean;
   /** 最近一次 start() 的时间戳（稳定性判定基准） */
   declare private lastStartAt: number;
   /** stdout 按行缓冲（协议行按 \n 切分）。用 declare + 构造器赋值，避免类字段降级出外部 helper */
@@ -303,6 +349,9 @@ export class HelperProcess {
     this.stopping = false;
     this.restartTimer = undefined;
     this.restartFailures = 0;
+    this.gpuCrashCount = 0;
+    this.gpuFallbackLevel = 0;
+    this.gpuFallbackNotified = false;
     this.lastStartAt = 0;
     this.stdoutBuffer = '';
   }
@@ -321,6 +370,13 @@ export class HelperProcess {
     // 否则 pnpm 无法 rename 覆盖 node_modules/dsh-pet。助手侧资源解析与 CWD 无关，故用 $DSH_HOME。
     const cwd = this.options.cwd || dshHomeDir();
     mkdirSync(cwd, { recursive: true }); // spawn 的 cwd 不存在会直接 ENOENT
+    // GPU 子进程崩溃自动降级（见 GPU_CRASH_RE）：达到阈值后重启带上 DSH_PET_DISABLE_GPU=2
+    // （--in-process-gpu）。放在 options.env 之后：自动降级优先，但用户显式选的更高档位
+    // 由 resolveGpuFallbackLevel 的 max() 保留。
+    const spawnEnv: NodeJS.ProcessEnv = {
+      ...this.options.env,
+      ...(this.gpuFallbackLevel > 0 ? { DSH_PET_DISABLE_GPU: String(this.gpuFallbackLevel) } : {}),
+    };
     const child = spawn(command, args, {
       cwd,
       // DSH_PET_HOST_PID：把**宿主自己的** pid 交给 helper，让它能判断"宿主还在不在"
@@ -332,7 +388,7 @@ export class HelperProcess {
       // 兜底，宿主非正常退出后 helper 会一直留着（issue #56 报告的就是这个）。
       // 环境变量统一经 helperSpawnEnv 构造：它会删掉会劫持 Electron 启动模式的 ELECTRON_RUN_AS_NODE
       // （issue #63，详见该函数注释）。
-      env: helperSpawnEnv(process.pid, this.options.env),
+      env: helperSpawnEnv(process.pid, spawnEnv),
       stdio: ['pipe', 'pipe', 'pipe'], // stdin 也要：bridge 协议响应回写（main.js 请求经 stdout 上来）
       windowsHide: true,
     });
@@ -363,6 +419,26 @@ export class HelperProcess {
     child.stderr.on('data', (chunk) => {
       const line = String(chunk).trim();
       if (line) this.logger.warn?.(`[dsh-pet desktop helper] ${line}`);
+      // GPU 子进程崩溃计数：一次崩溃在日志里会出现多行（进程退出 + FATAL 汇总），
+      // 所以计数后要与阈值比较而非按行累加触发——每见到签名就 +1，达到阈值即降级。
+      if (isGpuCrashLog(line)) {
+        this.gpuCrashCount += 1;
+        const next = resolveGpuFallbackLevel(
+          this.gpuFallbackLevel > 0 ? String(this.gpuFallbackLevel) : this.options.env?.DSH_PET_DISABLE_GPU,
+          this.gpuCrashCount,
+        );
+        if (next > this.gpuFallbackLevel) {
+          this.gpuFallbackLevel = next;
+          if (!this.gpuFallbackNotified) {
+            this.gpuFallbackNotified = true;
+            this.logger.warn?.(
+              `dsh-pet desktop helper: GPU 子进程反复崩溃（${this.gpuCrashCount} 次签名），` +
+                `已自动降级为 DSH_PET_DISABLE_GPU=${next}（--in-process-gpu）重启。` +
+                '若仍异常可手动设 DSH_PET_DISABLE_GPU=3；排障用 DSH_PET_FORCE_GPU=1 可恢复原状。',
+            );
+          }
+        }
+      }
     });
     child.stdin?.on('error', () => {
       /* EPIPE 等：进程退出/重启期间回写失败静默（下一轮 start 重建管道） */
@@ -479,6 +555,7 @@ export class HelperProcess {
     // 纯逻辑（restartBackoffDelayMs / shouldCircuitBreak / helperRunIsStable）在 helper-process.test.ts 有独立用例。
     if (helperRunIsStable(Date.now() - this.lastStartAt)) {
       this.restartFailures = 0;
+      this.gpuCrashCount = 0; // 稳定跑过一轮：GPU 崩溃计数同样清零（阈值重新武装，应对环境变化）
     } else {
       this.restartFailures += 1;
     }

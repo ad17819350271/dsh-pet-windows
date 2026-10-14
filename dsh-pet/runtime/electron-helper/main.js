@@ -47,6 +47,32 @@ try {
 }
 const { app, BrowserWindow, ipcMain, screen, shell, protocol } = electronApi;
 const path = require('node:path');
+
+/**
+ * 内嵌宿主模式（打包成独立 Windows App，`dsh-pet.exe`）：
+ * 宿主半边（路由表 / 配置聚合 / 状态仓 / 周期定时器）在**本进程**内跑，
+ * 窗口渲染端经 `http://127.0.0.1:<port>` 直接取数。
+ *
+ * 为什么不是 bridge：bridge 的前提是"宿主在另一个进程里，靠 stdout 管道 + 本地回调服务器通信"
+ * （见文件头的数据通道一节）——打包 App 里没有那个外部宿主，管道自然也不存在。
+ * 也不需要 CORS 之外的任何东西：`src/standalone/app-host.ts` 给每条路由补了 ACAO 头，
+ * file:// 源（origin = null）的 fetch 因此可以直达。
+ *
+ * 窗口进程要自己算两件事（原来由宿主经环境变量透传）：
+ *   DSH_PET_CONFIG_URL —— 指向本进程内那个 HTTP 服务的 /config；
+ *   DSH_PET_PETS       —— 该开几个窗口（display 含 desktop/both 的实例）。
+ * 见 whenReady 里的启动分支与 startEmbeddedHost()。
+ *
+ * 声明必须在**任何使用之前**（CJS 里 const 同样有 TDZ）：app.setName 与 BRIDGE 都要读它。
+ *
+ * 取值口径：**打包 App 默认开启**（自包含 exe 里没有外部宿主，内嵌是唯一成立的形态），
+ * 显式 DSH_PET_EMBED_HOST=0 可关掉（排障时想跑"老两进程形态"用）；
+ * 开发形态（electron.exe + 脚本）默认关闭，要显式 DSH_PET_EMBED_HOST=1 才走内嵌。
+ */
+const EMBED_HOST = process.env.DSH_PET_EMBED_HOST === '1' || (app.isPackaged && process.env.DSH_PET_EMBED_HOST !== '0');
+// 宿主半边（src/host/index.ts）在模块级读这个变量来决定"不 spawn 外部 helper"；
+// 它被本进程 require，读到的是同一个 process.env，所以这里先把值坐实（打包默认开启那条分支）。
+if (EMBED_HOST) process.env.DSH_PET_EMBED_HOST = '1';
 const { execFileSync } = require('node:child_process');
 const { readFileSync, writeFileSync } = require('node:fs');
 const fsPromises = require('node:fs/promises');
@@ -66,7 +92,8 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 // 显式定名：Helper 是被 `electron.exe <main.js>` 直接拉起的，Electron 取不到 app 名会回落成
 // "Electron"，userData 便落到 %APPDATA%\Electron —— 那是所有这么跑的 Electron 脚本的公共目录，
 // 我们的 DPI 缓存与 Chromium profile 都会和别人混在一起。必须赶在任何 getPath('userData') 之前设。
-app.setName('dsh-pet-electron-helper');
+// 内嵌宿主（打包 App）用 'dsh-pet'：与 App 自身的 package.json name 一致，是它自己的数据目录。
+app.setName(EMBED_HOST ? 'dsh-pet' : 'dsh-pet-electron-helper');
 
 /** DPI 探测子进程模式：不建窗口，只把主屏 scaleFactor 打到 stdout 就退出（见 probePrimaryScale） */
 const DPI_PROBE = process.env.DSH_PET_DPI_PROBE === '1';
@@ -118,8 +145,53 @@ if (!DPI_PROBE && HOST_PID > 0) {
 //   - 大透明窗移动覆盖小透明窗时，被覆盖窗口内容丢失（显示"消失"）
 // 本进程只渲染轻量宠物动画（640×360），改走软件合成以规避上述缺陷，
 // 不影响浏览器形态与主 DSH（独立进程）；非 Windows（macOS/Linux）合成路径不同，保留硬件加速。
+/** 排障用：DSH_PET_EXTRA_SWITCHES（逗号分隔）追加 Chromium switch，如 "in-process-gpu,no-sandbox" */
+const EXTRA_SWITCHES = (process.env.DSH_PET_EXTRA_SWITCHES || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+for (const extraSwitch of EXTRA_SWITCHES) {
+  app.commandLine.appendSwitch(extraSwitch);
+}
+
+/**
+ * GPU 降级档位（win32；供启动日志与排障读取）。
+ * 0 = 现状；1 = --disable-gpu；2 = --in-process-gpu；3 = 两者都加。
+ *
+ * 【背景】disableHardwareAcceleration 只停渲染侧硬件加速，Chromium 在 Windows 上**仍会拉起一个
+ * 独立的 GPU 进程**。在 RDP 会话、虚拟机、显卡驱动异常等环境里，该 GPU 进程以 0xC0000005
+ * （访问违例）反复退出，并令主进程 FATAL
+ * （gpu_data_manager_impl_private.cc: "GPU process isn't usable. Goodbye."）——
+ * helper 守护循环随之拉起→崩溃→重启，桌宠永远出不来，每轮还刷一屏 ERROR 日志。
+ * 本窗口内容只是 640×360 的 VP9-alpha 视频加一层轻量 DOM，软件合成 + 软件解码完全无感，
+ * Windows 上本来就禁用硬件加速，GPU 子进程没有保留价值。
+ *
+ * 【档位选择依据】（同一台机器实测，其余环境未回归，故保留用户/宿主显式档位优先）：
+ *   1  --disable-gpu        单独使用时 GPU 进程仍被拉起并崩溃（本版本无效，仅为兼容保留）
+ *   2  --in-process-gpu     GPU 服务并入浏览器进程，子进程崩溃消失，冒烟截图正常（实测 0 崩溃）
+ *   3  两者同加             某些 Chromium 版本需要组合才彻底不建 GPU 子进程
+ * 宿主 helper-process.ts 检测到同类崩溃会自动带上 2 重启；用户也可用
+ * DSH_PET_DISABLE_GPU=2 一步到位；DSH_PET_FORCE_GPU=1 排障时强制恢复原状。
+ */
+let GPU_SWITCH_LEVEL = 0;
+
 if (process.platform === 'win32') {
   app.disableHardwareAcceleration();
+  if (process.env.DSH_PET_FORCE_GPU !== '1') {
+    const explicit = Number.parseInt(process.env.DSH_PET_DISABLE_GPU || '', 10);
+    // 打包 App 默认档位 2（--in-process-gpu）：内嵌宿主模式下窗口进程**就是 App 进程**，
+    // GPU 子进程崩溃会把整个 App 带走——两进程形态里那套"宿主检测崩溃→带降级参数重启"
+    // （src/host/helper-process.ts 的 GPU_CRASH_RE）在这里没有宿主可做，死了就是死了。
+    // 而 Windows 上本来就 disableHardwareAcceleration，GPU 服务只是空转，并入浏览器进程
+    // 没有功能损失（实测该环境零崩溃）。显式设 DSH_PET_DISABLE_GPU 或 DSH_PET_FORCE_GPU=1 时不介入。
+    const packagedDefault = app.isPackaged ? 2 : 0;
+    const level = Number.isFinite(explicit) && explicit > 0 ? explicit : packagedDefault;
+    if (level > 0) {
+      if (level === 1 || level >= 3) app.commandLine.appendSwitch('disable-gpu');
+      if (level >= 2) app.commandLine.appendSwitch('in-process-gpu');
+      GPU_SWITCH_LEVEL = Math.min(level, 3);
+    }
+  }
 }
 
 // ---------- 全局 DPI 线性化（多显示器异构缩放的根因修复） ----------
@@ -252,8 +324,9 @@ function petScale() {
   });
 }
 
-/** bridge 模式：DSH_PET_BRIDGE=1（宿主注入）。开启时注册 dsh-pet-bridge scheme + 管道转发 */
-const BRIDGE = process.env.DSH_PET_BRIDGE === '1';
+/** bridge 模式：DSH_PET_BRIDGE=1（宿主注入）。开启时注册 dsh-pet-bridge scheme + 管道转发。
+ *  内嵌宿主（EMBED_HOST，见文件顶部）没有外部宿主进程可转发，一律不启用。 */
+const BRIDGE = process.env.DSH_PET_BRIDGE === '1' && !EMBED_HOST;
 
 /** 「打开网站」这一项的去向（宿主按自身形态注入）：
  *  'desktop' = 宿主是 DSH 桌面应用 → 唤起桌面应用主窗口；
@@ -282,6 +355,62 @@ if (BRIDGE) {
 
 /** 窗口表：petId -> BrowserWindow */
 const windows = new Map();
+
+/** 内嵌宿主的释放句柄（仅 EMBED_HOST；退出时收尾） */
+let embeddedHost = null;
+
+/**
+ * 应用根目录（包根）：打包后 = `<exe 所在目录>/resources/app`，开发时 = 本文件上两级。
+ * lib/app-host.cjs 与 assets/ 都相对它定位。
+ */
+function appRootDir() {
+  return app.isPackaged ? path.join(process.resourcesPath, 'app') : path.resolve(__dirname, '..', '..');
+}
+
+/**
+ * 内嵌宿主：在**本进程**里把宿主半边拉起来（见文件头 EMBED_HOST），并把窗口需要的环境变量就地写好。
+ * 不 spawn 任何子进程——这正是打包 App 能做到"单 exe、无外部 Node、无下载"的原因。
+ * @returns 宿主是否就绪（未就绪时调用方不建窗：没有数据源，建出来也是个空窗）
+ */
+async function startEmbeddedHost() {
+  const hostPath = path.join(appRootDir(), 'lib', 'app-host.cjs');
+  try {
+    // CJS 产物：Electron 主进程 require 即可（tsdown 的第四份配置，见 tsdown.config.mjs）
+    const host = require(hostPath);
+    embeddedHost = await host.startPetHost({
+      port: Number(process.env.DSH_PET_PORT) || undefined,
+      // POST /shutdown → 退出整个 App：打包 App 没有窗口关闭按钮、右键菜单也没有「退出」项，
+      // 这是唯一的脚本化退出入口（dist 里附带的 stop-pet.cmd 就走它）。
+      onShutdown: () => app.quit(),
+      logger: {
+        info: (m) => console.error('[dsh-pet-host] ' + m),
+        warn: (m) => console.error('[dsh-pet-host] ' + m),
+        error: (m) => console.error('[dsh-pet-host] ' + m),
+        debug: () => {},
+      },
+    });
+    // 窗口进程自己算这两件（原由宿主经环境变量透传；createPetWindows 在建窗时读它们）
+    process.env.DSH_PET_CONFIG_URL = embeddedHost.configUrl;
+    process.env.DSH_PET_PETS = JSON.stringify(host.readDesktopPets());
+    if (!process.env.DSH_PET_SCALE) process.env.DSH_PET_SCALE = '1';
+    console.error(
+      '[dsh-pet-desktop-helper] embedded host ready: ' +
+        embeddedHost.configUrl +
+        ' pets=' +
+        process.env.DSH_PET_PETS,
+    );
+    return true;
+  } catch (error) {
+    console.error(
+      '[dsh-pet-desktop-helper] embedded host failed: ' +
+        (error instanceof Error ? error.message : String(error)) +
+        ' (expected ' +
+        hostPath +
+        ')',
+    );
+    return false;
+  }
+}
 
 /** win.id -> 上一次**请求**的内容区矩形（"x,y,w,h"）：pet:set-bounds 的去重基准，见那里的注释 */
 const lastRequestedBounds = new Map();
@@ -506,7 +635,9 @@ function createPetWindows() {
       offBodyMs.delete(win.id);
     });
     win
-      .loadFile('index.html', {
+      // 绝对路径：相对路径按 app.getAppPath() 解析——开发时那是 runtime/electron-helper（碰巧对），
+      // 打包后却是 resources/app（index.html 不在那儿）→ 页面 ERR_FILE_NOT_FOUND、宠物窗口空白。
+      .loadFile(path.join(__dirname, 'index.html'), {
         query: {
           configUrl,
           bridge: BRIDGE ? '1' : '0',
@@ -634,7 +765,7 @@ async function handleBridgeRequest(request) {
   return new Response(resp.body ?? '', { status: resp.status || 200, headers });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // 探测子进程：此时没有 force-device-scale-factor，读到的是 Windows 的真实主屏缩放。
   // 退出推迟一拍——在 ready 回调里直接 app.exit() 会赶在 stdout 落盘前拆掉进程
   if (DPI_PROBE) {
@@ -650,8 +781,30 @@ app.whenReady().then(() => {
       ' primaryScale=' +
       (PRIMARY_SCALE || 'unknown') +
       ' petScale=' +
-      petScale(),
+      petScale() +
+      ' gpuSwitchLevel=' +
+      GPU_SWITCH_LEVEL,
   );
+
+  // 内嵌宿主（打包 App）：先起宿主半边，再建窗——createPetWindows 读它写好的 configUrl/pets
+  if (EMBED_HOST) {
+    const hostReady = await startEmbeddedHost();
+    if (!hostReady) {
+      // 没有宿主 = 没有配置与素材：不建窗。打包 App 是双击启动的，用户看不到控制台，
+      // 所以用系统弹窗把原因摆出来（而不是留下一个"点了没反应"的进程）。
+      const { dialog } = electronApi;
+      try {
+        dialog.showErrorBox(
+          'dsh-pet 启动失败',
+          '内嵌宿主未能启动（应用文件可能不完整）。\n请重新解压/重新打包，或查看日志中的 [dsh-pet-host] 行。',
+        );
+      } catch {
+        /* 无 GUI 会话时忽略 */
+      }
+      app.quit();
+      return;
+    }
+  }
 
   if (BRIDGE) {
     // 自定义 scheme 接住渲染端全部请求（配置/余额/碎碎念/广播/素材）
@@ -1077,4 +1230,14 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   app.quit();
+});
+
+// 内嵌宿主收尾（仅 EMBED_HOST）：停插件的周期定时器、关本进程内的 HTTP 服务。
+// 进程随后就退，所以这里 best-effort、不阻塞退出。
+app.on('will-quit', () => {
+  if (embeddedHost) {
+    const host = embeddedHost;
+    embeddedHost = null;
+    void host.dispose().catch(() => {});
+  }
 });

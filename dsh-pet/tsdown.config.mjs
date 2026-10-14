@@ -80,4 +80,39 @@ export default defineConfig([
       '@deepseek-ai/dsh-llm': shim('dsh-llm'),
     },
   },
+  {
+    ...shared,
+    // 内嵌宿主入口（打包成独立 Windows App 用）—— lib/app-host.cjs
+    //
+    // 与独立模式 CLI 的两点不同：
+    //   1. 编成 **CJS**：消费方是 Electron 主进程（runtime/electron-helper/main.js，CJS），
+    //      `require()` 最省事，不必在主进程里绕动态 import 的 ESM 路径；
+    //   2. 除三个 DSH 替身外，再把 `@electron/get` 与 `@electron-internal/extract-zip`
+    //      一并换成替身（见 shims/electron-get.ts 的说明）—— 打包 App 自带 Electron，
+    //      下载/解压两条路径永远不会走，产物因此**零 node_modules**。
+    format: ['cjs'],
+    target: 'es2022',
+    entry: {
+      'app-host': 'src/standalone/app-host.ts',
+    },
+    // noExternal 必须把 @electron/get 与 extract-zip 也拉进来，alias 才轮得到生效；
+    // 同时 external 里把 @electron/get 排除掉（`/^@electron\//` 若照抄会先把它判成外部）。
+    noExternal: [
+      /^@deepseek-ai\/(?:dsh-home-paths|dsh-credentials|dsh-llm)$/,
+      /^@electron\/get$/,
+      /^@electron-internal\/extract-zip$/,
+    ],
+    external: [
+      /^@electron\/(?!get$)/,
+      /^node:/,
+      /^@deepseek-ai\/(?!dsh-home-paths$|dsh-credentials$|dsh-llm$)/,
+    ],
+    alias: {
+      '@deepseek-ai/dsh-home-paths': shim('dsh-home-paths'),
+      '@deepseek-ai/dsh-credentials': shim('dsh-credentials'),
+      '@deepseek-ai/dsh-llm': shim('dsh-llm'),
+      '@electron/get': shim('electron-get'),
+      '@electron-internal/extract-zip': shim('extract-zip'),
+    },
+  },
 ]);

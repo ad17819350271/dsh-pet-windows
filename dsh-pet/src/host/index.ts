@@ -127,6 +127,14 @@ const PACKAGE_MEMES_DIR = join(PACKAGE_ROOT_ASSETS, 'memes');
 const ROUTE_PREFIX = '/dsh-pet-7340';
 
 /**
+ * 内嵌宿主模式（打包成独立 Windows App，`dsh-pet.exe`）：
+ * 窗口由**同一个进程**的 App 主进程创建（见 `runtime/electron-helper/main.js` 的 DSH_PET_EMBED_HOST），
+ * 因此宿主半边**不再 spawn 外部 helper**——那会拉起第二个进程、并依赖一个不存在的 Node 宿主。
+ * 由 `src/standalone/app-host.ts`（`startPetHost`）设置该变量。
+ */
+const EMBED_HOST = process.env.DSH_PET_EMBED_HOST === '1';
+
+/**
  * 宿主是不是 **DSH 桌面应用**（Electron 宿主）。
  *
  * 判据只用 `process.versions.electron`：桌面应用以 `ELECTRON_RUN_AS_NODE=1` 跑宿主（见 dsh.cmd），
@@ -634,6 +642,8 @@ export function apply(ctx: any): void {
   /** 用已确认存在的 Electron 路径拉起桌面 Helper（每只桌面宠物一个局部小窗口）。 */
   const launchHelper = (electronPath: string | undefined): void => {
     if (helper || disposed) return;
+    // 内嵌宿主（打包 App）：窗口由本进程的 App 主进程自己建，宿主半边不 spawn、也不下载 Electron
+    if (EMBED_HOST) return;
     if (!hasDesktopPet) return; // 无宠物显示在桌面（display 含 desktop/both）：不启动
     const port = typeof ctx.webServer?.port === 'number' ? ctx.webServer.port : 0;
     if (!port || port <= 0) {
@@ -707,6 +717,8 @@ export function apply(ctx: any): void {
    *  （不 spawn 子进程，CLI node 与 DSH Desktop 均适用），下载完成后自动拉起。 */
   const startHelper = (): void => {
     if (helper || electronEnsure || disposed) return;
+    // 内嵌宿主（打包 App）：Electron 就是 App 自己，既不探测也不下载（见 EMBED_HOST）
+    if (EMBED_HOST) return;
     if (!hasDesktopPet) return; // 无宠物显示在桌面（display 含 desktop/both）：不启动
     // 无图形显示环境（Linux 服务器 / 容器）：直接放弃，不探测、不下载、不拉起。
     // 否则 Electron 会「拉起即崩」，被守护循环反复重启并刷满 core dump。

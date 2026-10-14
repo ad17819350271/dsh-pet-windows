@@ -76,6 +76,7 @@
     "build:desktop-core": "node scripts/build-desktop-core.mjs",
     "watch": "tsdown --watch",
     "ensure:electron": "node scripts/ensure-electron.mjs",
+    "pack:win": "node scripts/pack-win.mjs",
     "start:desktop": "node scripts/start-desktop.mjs",
     "standalone": "node lib/standalone.js",
     "dev:mock": "node scripts/dev/mock-server.mjs",

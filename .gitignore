@@ -39,6 +39,9 @@ temp/
 dsh-pet/lib/
 dsh-pet/runtime/electron-helper/shared-core.js
 
+# ── Windows 便携 App（scripts/pack-win.mjs 产出：Electron 运行时 + resources/app，约 400MB，不入仓库）──
+dsh-pet/dist/
+
 # ── IDE / 编辑器 ──
 .idea/
 .vscode/

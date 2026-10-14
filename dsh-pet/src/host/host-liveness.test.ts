@@ -173,8 +173,10 @@ describe('守卫：main.js 的两条路必须都在位（helper 随包发行，�
 describe('守卫：宿主侧必须把 pid 注入（否则 B 永远不生效）', () => {
   test('helper-process.ts：唯一的 spawn 点经 helperSpawnEnv 注入 DSH_PET_HOST_PID', () => {
     const src = readSource('./helper-process.ts');
+    // 第二个参数允许是包装变量（GPU 崩溃自动降级要把 DSH_PET_DISABLE_GPU 并进去），
+    // 但「env: helperSpawnEnv(process.pid, …)」这一形态本身不许变——pid 注入只此一处。
     assert.ok(
-      /env: helperSpawnEnv\(process\.pid, this\.options\.env\)/.test(src),
+      /env: helperSpawnEnv\(process\.pid, /.test(src),
       'spawn 的 env 必须经 helperSpawnEnv 注入宿主 pid（放在唯一 spawn 点，所有调用方自动获得）',
     );
   });
