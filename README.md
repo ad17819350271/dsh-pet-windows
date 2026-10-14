@@ -139,6 +139,10 @@ dsh-pet.exe
 （`src/standalone/app-host.ts`、`runtime/electron-helper/main.js`、`src/host/index.ts`、
 `src/host/helper-process.ts`、`tsdown.config.mjs`、`scripts/pack-win.mjs`）加两个 shim。
 
+除上表改动外，本仓库**只额外移除**了上游的 `.github/workflows/hevc-alpha.yml`：那是
+macOS/Safari 专用的 HEVC-with-Alpha 素材转码流水线（手动触发），与 Windows 版无关；
+其余文件（含全部素材、素材处理脚本、插件文档）与上游一致。
+
 ## 许可与致谢
 
 - 本项目沿用上游的 **MIT License**（见 [`LICENSE`](LICENSE)），版权归原作者 **PC2005-cloud** 所有。
